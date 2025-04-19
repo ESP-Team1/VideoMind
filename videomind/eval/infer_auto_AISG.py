@@ -46,7 +46,7 @@ if __name__ == '__main__':
     # NOTE:
     # 1. grounder is always true so no need to store
     # 2. answerer would always be used (when set to false, the base model would be used as the answerer)
-    adapter_state = dict(planner=False, verifier=False, answerer=False)
+    adapter_state = dict(planner=True , verifier=True, answerer=False )
 
     print('Initializing role *grounder*')
     model, processor = build_model(args.model_gnd_path, device="cuda")
@@ -80,9 +80,8 @@ if __name__ == '__main__':
     
 
     dumps = []
-    for idx, row in nncore.ProgressBar(enumerate(question_csv.iterrows())):
-        
-        video_id, question, question_prompt, duration = row['video_id'], row['question'], row['question_prompt'], row['duration']
+    for idx, row in nncore.ProgressBar(question_csv.iterrows()):
+        video_id, question, question_prompt, duration = row['video_id'], row['question'], row['question_prompt'], float(row['duration'])
 
         video_path = os.path.join(args.video_dir, f"{video_id}.mp4")
 
@@ -91,10 +90,13 @@ if __name__ == '__main__':
         print(f"Question: {question}")
         print(f"Question Prompt: {question_prompt}")
 
-        combined_prompt = question + '\n' + question_prompt
+        question = question + '\n' + question_prompt
 
         # do grounding by default
         do_grounding = True
+        prompt = question
+        query = question
+
 
         # initialize grounding query as question
         dump = {'question': question, 'question_prompt': question_prompt, 'duration': duration, 'video_id': video_id}
@@ -102,7 +104,7 @@ if __name__ == '__main__':
         dump['agents'] = []
         
 
-        if adapter_state['planner'] and (args.auto_rephrasing or args.auto_planning):
+        if adapter_state['planner'] :
             print('=============== planner ===============')
 
             dump['agents'].append('planner')
@@ -117,10 +119,10 @@ if __name__ == '__main__':
                     'min_pixels': 36 * 28 * 28,
                     'max_pixels': 64 * 28 * 28,
                     'max_frames': 100,
-                    'fps': 1.0
+                    'fps': 2.0
                 }, {
                     'type': 'text',
-                    'text': PLANNER_PROMPT.format(combined_prompt)
+                    'text': PLANNER_PROMPT.format(question)
                 }]
             }]
 
@@ -130,10 +132,24 @@ if __name__ == '__main__':
             data = processor(text=[text], images=images, videos=videos, return_tensors='pt')
             data = data.to(device)
 
-            model.base_model.disable_adapter_layers()
-            model.base_model.enable_adapter_layers()
-            model.set_adapter('planner')
+            # Ensure proper batch dimensions and shapes
+            if isinstance(data.input_ids, torch.Tensor):
+                if data.input_ids.dim() == 1:
+                    data.input_ids = data.input_ids.unsqueeze(0)
+                if data.attention_mask.dim() == 1:
+                    data.attention_mask = data.attention_mask.unsqueeze(0)
+                # Ensure attention mask matches input_ids shape
+                if data.attention_mask.size(1) != data.input_ids.size(1):
+                    data.attention_mask = torch.ones_like(data.input_ids)
 
+            # First ensure we're starting from a clean state
+            model.base_model.disable_adapter_layers()
+            torch.cuda.empty_cache()  # Clear any residual tensors
+            
+            # Then enable the planner adapter
+            model.set_adapter('planner')
+            model.base_model.enable_adapter_layers()
+            
             output_ids = model.generate(
                 **data,
                 do_sample=False,
@@ -148,17 +164,17 @@ if __name__ == '__main__':
             if output_ids[-1] == processor.tokenizer.eos_token_id:
                 output_ids = output_ids[:-1]
             response = processor.decode(output_ids, clean_up_tokenization_spaces=False)
-            print(response)
+            print("planner response: ", response)
 
             dump['planner_response'] = response
 
             try:
                 parsed = json.loads(response)
                 action = parsed[0] if isinstance(parsed, list) else parsed
-                if args.auto_rephrasing and action['type'].lower() == 'grounder' and action['value']:
+                if action['type'].lower() == 'grounder' and action['value']:
                     query = action['value']
                     dump['planner_parsed_query'] = query
-                elif args.auto_planning and action['type'].lower() == 'answerer':
+                elif action['type'].lower() == 'answerer':
                     do_grounding = False
             except Exception:
                 print('WARNING: Failed to parse planner response')
@@ -180,7 +196,7 @@ if __name__ == '__main__':
                     'min_pixels': 36 * 28 * 28,
                     'max_pixels': 64 * 28 * 28,
                     'max_frames': 150,
-                    'fps': 1.0
+                    'fps': 2.0
                 }, {
                     'type': 'text',
                     'text': GROUNDER_PROMPT.format(query)
@@ -192,6 +208,16 @@ if __name__ == '__main__':
             images, videos = process_vision_info(messages)
             data = processor(text=[text], images=images, videos=videos, return_tensors='pt')
             data = data.to(device)
+
+            # Ensure proper batch dimensions and shapes
+            if isinstance(data.input_ids, torch.Tensor):
+                if data.input_ids.dim() == 1:
+                    data.input_ids = data.input_ids.unsqueeze(0)
+                if data.attention_mask.dim() == 1:
+                    data.attention_mask = data.attention_mask.unsqueeze(0)
+                # Ensure attention mask matches input_ids shape
+                if data.attention_mask.size(1) != data.input_ids.size(1):
+                    data.attention_mask = torch.ones_like(data.input_ids)
 
             model.base_model.disable_adapter_layers()
             model.base_model.enable_adapter_layers()
@@ -225,7 +251,7 @@ if __name__ == '__main__':
                 pred = pred.clamp(min=0, max=duration)
 
                 # 3. round timestamps to units
-                unit = getattr(DATASETS.get(args.dataset), 'UNIT', 0.001)
+                unit = 0.001
                 pred = torch.round(pred / unit).long() * unit
 
                 # 4. sort timestamps
@@ -276,10 +302,10 @@ if __name__ == '__main__':
                         'min_pixels': 36 * 28 * 28,
                         'max_pixels': 64 * 28 * 28,
                         'max_frames': 64,
-                        'fps': 2.0
+                        'fps': 3.0
                     }, {
                         'type': 'text',
-                        'text': VERIFIER_PROMPT.format(combined_prompt)
+                        'text': VERIFIER_PROMPT.format(question)
                     }]
                 }]
 
@@ -345,11 +371,9 @@ if __name__ == '__main__':
         # choose the potential best moment
         selected = pred[0] if 'pred' in dump else [0, duration]
 
-        min_len = getattr(DATASETS.get(args.dataset), 'MIN_LEN', 32)
-        s, e = parse_span(selected, duration, min_len)
+        
+        s, e = parse_span(selected, duration)
         print([s, e], duration)
-
-        prompt = f'You are given a video with {round(e - s, 1)} seconds long.' + combined_prompt
 
         messages = [{
             'role':
@@ -363,7 +387,7 @@ if __name__ == '__main__':
                 'min_pixels': 128 * 28 * 28,
                 'max_pixels': 256 * 28 * 28,
                 'max_frames': 32,
-                'fps': 2.0
+                'fps': 30.0
             }, {
                 'type': 'text',
                 'text': prompt
@@ -376,10 +400,13 @@ if __name__ == '__main__':
         data = processor(text=[text], images=images, videos=videos, return_tensors='pt')
         data = data.to(device)
 
-        model.base_model.disable_adapter_layers()
-        model.base_model.enable_adapter_layers()
-        model.set_adapter('answerer')
-        context = nullcontext
+        if adapter_state['answerer']:
+                model.base_model.disable_adapter_layers()
+                model.base_model.enable_adapter_layers()
+                model.set_adapter('answerer')
+                context = nullcontext
+        else:
+            context = model.disable_adapter
 
         with context():
             output_ids = model.generate(
