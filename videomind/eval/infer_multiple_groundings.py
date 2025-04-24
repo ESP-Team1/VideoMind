@@ -5,35 +5,8 @@ import argparse
 import pandas as pd 
 import sys
 
-segmenter_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tools'))
-sys.path.append(segmenter_dir)
-
-from segmenter import segmenter
-
-
-def run_infer_grounding(video_path, query, output_path):
-    """
-    Calls infer_grounding.py with the given video path and query.
-    
-    Args:
-        video_path (str): Path to the input video.
-        query (str): Query to evaluate.
-        output_path (str): Path to save the results.
-
-    Returns:
-        dict: The results from infer_grounding.py, including grounded timestamps and new video path.
-    """
-    command = [
-        "python", "infer_grounding.py",
-        "--video_path", video_path,
-        "--query", query,
-        "--output_path", output_path
-    ]
-    subprocess.run(command, check=True)
-
-    with open(output_path, "r") as f:
-        results = json.load(f)
-    return results
+from infer_grounding import infer_grounding
+from segmenter import VideoSegmenter
 
 def query_parser(query_csv):
     """
@@ -46,7 +19,7 @@ def query_parser(query_csv):
         list: A list of queries.
     """
     df = pd.read_excel(query_csv)
-    queries = df['grounding_queries'].tolist()
+    queries = df['query'].tolist()
     return queries
 
 def process_queries(video_path, query_csv, temp_dir="temp_results", segmenter=None):
@@ -55,44 +28,57 @@ def process_queries(video_path, query_csv, temp_dir="temp_results", segmenter=No
 
     Args:
         video_path (str): Path to the initial video.
-        queries (list): List of queries to process.
+        query_csv (str): Path to the CSV file containing queries.
         temp_dir (str): Directory to store temporary results.
+        segmenter (VideoSegmenter): Segmenter instance for extracting video segments.
 
     Returns:
-        dict: A dictionary where keys are queries and values are grounded timestamps.
+        dict: A dictionary where keys are queries and values are the extracted results.
     """
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
 
     queries = query_parser(query_csv)
 
-    results = {}
+    results_dict = {}
     current_video_path = video_path
 
     for i, query in enumerate(queries):
         print(f"Processing query {i + 1}/{len(queries)}: {query}")
 
+        # Call infer_grounding
+        grounding_result = infer_grounding(current_video_path, query, segmenter=segmenter)
+
+        # Save the first-ranked predicted duration
+        first_ranked_pred = grounding_result.get("pred", [[0, 0]])[0]  # Default to [0, 0] if no predictions
+
+        # Update the current video path if needed
+        cropped_video_path = grounding_result.get("cropped_video_path", current_video_path)
+        predicted_time_stamp = first_ranked_pred
+
+        # Extract video segments using the segmenter
+        extracted_results = segmenter.extract_segments_with_blackout(
+            video_path, first_ranked_pred[0], first_ranked_pred[1]
+        )
+        current_video_path = extracted_results["leftover_video"].get("path")
+
+        # Save the result to temp_dir
         output_path = os.path.join(temp_dir, f"result_query_{i + 1}.json")
+        with open(output_path, 'w') as f:
+            json.dump(extracted_results, f)
 
-        grounding_result = run_infer_grounding(current_video_path, query, output_path, segmenter)
+        # Add the extracted results to the dictionary with the query as the key
+        results_dict[query] = extracted_results
 
-        grounded_timestamps = grounding_result.get("grounder_response", [])
-        new_video_path = grounding_result.get("cropped_video_path", current_video_path)
-
-        results[query] = grounded_timestamps
-
-        current_video_path = new_video_path
-
-    return results
-
+    return results_dict
 
 def parse_args():
     """
     Parses command-line arguments.
     """
     parser = argparse.ArgumentParser(description="Process multiple queries on a single video using infer_grounding.py.")
-    parser.add_argument("--video_path", default="dataset/sj81PWrerDk.mp4", help="Path to the initial video.")
-    parser.add_argument("--query_csv", default="dataset/queries.xlsx", help="Path to the CSV file containing queries.")
+    parser.add_argument("--video_path", default="videomind/eval/dataset/sj81PWrerDk.mp4", help="Path to the initial video.")
+    parser.add_argument("--query_csv", default="videomind/eval/dataset/queries.xlsx", help="Path to the CSV file containing queries.")
     parser.add_argument("--temp_dir", default="temp_results", help="Directory to store temporary results.")
     parser.add_argument("--output_path", default="results/final_results.json", help="Path to save the final results.")
     return parser.parse_args()
@@ -101,7 +87,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    segmenter = segmenter.VideoSegmenter()
+    segmenter = VideoSegmenter()
     final_results = process_queries(args.video_path, args.query_csv, args.temp_dir, segmenter)
 
     print("Final results:")

@@ -1,16 +1,17 @@
 import json
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+import argparse
 import torch
 from videomind.constants import GROUNDER_PROMPT, VERIFIER_PROMPT
 from videomind.dataset.utils import process_vision_info
 from videomind.model.builder import build_model
 from videomind.utils.parser import parse_query, parse_span
-segmenter_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tools'))
-sys.path.append(segmenter_dir)
+from segmenter import VideoSegmenter
 
-from segmenter import segmenter
-
-def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', model_ver_path='model_zoo/VideoMind-7B', num_threads=1, device='cuda', segmenter=None):
+def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', model_ver_path='model_zoo/VideoMind-7B', num_threads=1, device='cuda', segmenter=None, args=None):
     """
     Runs the grounding and verification process for a given video and query.
 
@@ -42,10 +43,7 @@ def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', 
     print(f"Video: {video_path}")
     print(f"Query: {query}")
 
-    # Grounder evaluation
-    print('=============== grounder ===============')
-    query = parse_query(query)
-
+    # Prepare the input message for the grounder
     messages = [{
         'role': 'user',
         'content': [{
@@ -62,6 +60,7 @@ def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', 
         }]
     }]
 
+    # Process the input
     text = processor.apply_chat_template(messages, add_generation_prompt=True)
     print(text)
     images, videos = process_vision_info(messages)
@@ -77,6 +76,7 @@ def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', 
         if data.attention_mask.size(1) != data.input_ids.size(1):
             data.attention_mask = torch.ones_like(data.input_ids)
 
+    # Grounder inference
     model.base_model.disable_adapter_layers()
     model.base_model.enable_adapter_layers()
     model.set_adapter('grounder')
@@ -88,27 +88,63 @@ def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', 
         top_p=None,
         top_k=None,
         repetition_penalty=None,
-        max_new_tokens=256)
+        max_new_tokens=256
+    )
 
     assert data.input_ids.size(0) == output_ids.size(0) == 1
     output_ids = output_ids[0, data.input_ids.size(1):]
     if output_ids[-1] == processor.tokenizer.eos_token_id:
         output_ids = output_ids[:-1]
-    grounder_response = processor.decode(output_ids, clean_up_tokenization_spaces=False)
-    print("Grounder response:", grounder_response)
+    response = processor.decode(output_ids, clean_up_tokenization_spaces=False)
 
-    # Verifier evaluation
-    probs = []
-    if adapter_state['verifier']:
+    # Parse grounder response
+    dump = {'video_path': video_path, 'query': query, 'grounder_response': response}
+    dump['grounder_success'] = len(model.reg) > 0
+
+    if dump['grounder_success']:
+        # Extract timestamps and confidences
+        duration = 1.0  # Placeholder for video duration; replace with actual duration if available
+        blob = model.reg[0].cpu().float()
+        pred, conf = blob[:, :2] * duration, blob[:, -1].tolist()
+
+        # Clamp timestamps
+        pred = pred.clamp(min=0, max=duration)
+
+        # Round timestamps to units
+        unit = 0.001
+        pred = torch.round(pred / unit).long() * unit
+
+        # Sort timestamps
+        inds = (pred[:, 1] - pred[:, 0] < 0).nonzero()[:, 0]
+        pred[inds] = pred[inds].roll(1)
+
+        # Convert timestamps to list
+        pred = pred.tolist()
+    else:
+        print('WARNING: Failed to parse grounder response')
+
+        if adapter_state['verifier']:
+            pred = [[i * duration / 6, (i + 2) * duration / 6] for i in range(5)]
+            conf = [0] * 5
+        else:
+            pred = [[0, duration]]
+            conf = [0]
+
+    print(pred[0], duration)
+    dump['pred'] = pred
+    dump['conf'] = conf
+
+    # Verifier logic
+    if adapter_state['verifier'] and len(pred) > 1:
         print('=============== verifier ===============')
 
-        # Example: Using the first prediction from the grounder
-        pred = [[0, 10]]  # Replace with actual prediction from the grounder if available
-        for cand in pred:
-            s0, e0 = parse_span(cand, 10, 2)  # Replace 10 with actual video duration
+        probs = []
+        for cand in pred[:5]:
+            s0, e0 = parse_span(cand, duration, 2)
             offset = (e0 - s0) / 2
-            s1, e1 = parse_span([s0 - offset, e0 + offset], 10)
+            s1, e1 = parse_span([s0 - offset, e0 + offset], duration)
 
+            # Prepare verifier input
             messages = [{
                 'role': 'user',
                 'content': [{
@@ -131,6 +167,25 @@ def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', 
             print(text)
             images, videos = process_vision_info(messages)
             data = processor(text=[text], images=images, videos=videos, return_tensors='pt')
+
+            # Insert segment start/end tokens
+            video_grid_thw = data['video_grid_thw'][0]
+            num_frames, window = int(video_grid_thw[0]), int(video_grid_thw[1] * video_grid_thw[2] / 4)
+            assert num_frames * window * 4 == data['pixel_values_videos'].size(0)
+
+            pos_s, pos_e = round(s0 * num_frames), round(e0 * num_frames)
+            pos_s, pos_e = min(max(0, pos_s), num_frames), min(max(0, pos_e), num_frames)
+            assert pos_s <= pos_e, (num_frames, s0, e0)
+
+            base_idx = torch.nonzero(data['input_ids'][0] == model.config.vision_start_token_id).item()
+            pos_s, pos_e = pos_s * window + base_idx + 1, pos_e * window + base_idx + 2
+
+            input_ids = data['input_ids'][0].tolist()
+            input_ids.insert(pos_s, model.config.seg_s_token_id)
+            input_ids.insert(pos_e, model.config.seg_e_token_id)
+            data['input_ids'] = torch.LongTensor([input_ids])
+            data['attention_mask'] = torch.ones_like(data['input_ids'])
+
             data = data.to(device)
 
             model.base_model.disable_adapter_layers()
@@ -140,33 +195,34 @@ def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', 
             with torch.inference_mode():
                 logits = model(**data).logits[0, -1].softmax(dim=-1)
 
-            # NOTE: magic numbers here
-            # In Qwen2-VL vocab: 9454 -> Yes, 2753 -> No
+            # Calculate score
             score = (logits[9454] - logits[2753]).sigmoid().item()
             probs.append(score)
 
-        print("Verifier probabilities:", probs)
+        # Rank predictions by verifier scores
+        ranks = torch.Tensor(probs).argsort(descending=True).tolist()
+        print(probs)
+        print(ranks)
 
-    grounded_timestamps = segmenter.parse_timestamps(grounder_response)
-    cropped_video_path = segmenter.extract_segments_with_blackout(video_path, grounded_timestamps[0], grounded_timestamps[1])
-    results = {
-        'cropped_video_path': cropped_video_path,
-        'query': query,
-        'grounder_response': grounder_response,
-        'grounded_timestamps': grounded_timestamps,
-        'verifier_probs': probs if adapter_state['verifier'] else None
-    }
+        pred = [pred[idx] for idx in ranks]
+        conf = [conf[idx] for idx in ranks]
+        dump['probs'] = probs
+        dump['ranks'] = ranks
+        dump['pred_ori'] = dump['pred']
+        dump['conf_ori'] = dump['conf']
+        dump['pred'] = pred
+        dump['conf'] = conf
 
-    return results
-
+    return dump
+    
 def main():
     """
     Main function to test the infer_grounding function.
     """
-    video_path = "dataset/sj81PWrerDk.mp4"
+    video_path = "videomind/eval/dataset/sj81PWrerDk.mp4"
     query = "The first two people doing the action"
 
-    segmenter = segmenter.VideoSegmenter()
+    segmenter = VideoSegmenter()
 
     results = infer_grounding(video_path, query, segmenter=segmenter)
 
