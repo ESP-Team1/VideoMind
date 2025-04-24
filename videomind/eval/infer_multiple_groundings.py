@@ -1,9 +1,7 @@
-import subprocess
 import json
 import os
 import argparse
 import pandas as pd 
-import sys
 
 from infer_grounding import infer_grounding
 from segmenter import VideoSegmenter
@@ -46,28 +44,19 @@ def process_queries(video_path, query_csv, temp_dir="temp_results", segmenter=No
     for i, query in enumerate(queries):
         print(f"Processing query {i + 1}/{len(queries)}: {query}")
 
-        # Call infer_grounding
         grounding_result = infer_grounding(current_video_path, query, segmenter=segmenter)
 
-        # Save the first-ranked predicted duration
         first_ranked_pred = grounding_result.get("pred", [[0, 0]])[0]  # Default to [0, 0] if no predictions
 
-        # Update the current video path if needed
-        cropped_video_path = grounding_result.get("cropped_video_path", current_video_path)
-        predicted_time_stamp = first_ranked_pred
-
-        # Extract video segments using the segmenter
         extracted_results = segmenter.extract_segments_with_blackout(
-            video_path, first_ranked_pred[0], first_ranked_pred[1]
+            current_video_path, first_ranked_pred[0], first_ranked_pred[1]
         )
         current_video_path = extracted_results["leftover_video"].get("path")
 
-        # Save the result to temp_dir
         output_path = os.path.join(temp_dir, f"result_query_{i + 1}.json")
         with open(output_path, 'w') as f:
             json.dump(extracted_results, f)
 
-        # Add the extracted results to the dictionary with the query as the key
         results_dict[query] = extracted_results
 
     return results_dict
@@ -85,6 +74,9 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    """
+    Main function to test the infer_multiple_groundings function.
+    """
     args = parse_args()
 
     segmenter = VideoSegmenter()

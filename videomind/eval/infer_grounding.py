@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 import argparse
 import torch
@@ -219,7 +218,7 @@ def main():
     """
     Main function to test the infer_grounding function.
     """
-    video_path = "videomind/eval/dataset/sj81PWrerDk.mp4"
+    video_path = "videomind/eval/dataset/sj81PWrerDk.mp4" # Replace with your video path
     query = "The first two people doing the action"
 
     segmenter = VideoSegmenter()
