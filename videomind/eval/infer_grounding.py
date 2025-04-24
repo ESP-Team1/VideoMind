@@ -5,7 +5,10 @@ from videomind.constants import GROUNDER_PROMPT, VERIFIER_PROMPT
 from videomind.dataset.utils import process_vision_info
 from videomind.model.builder import build_model
 from videomind.utils.parser import parse_query, parse_span
+segmenter_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tools'))
+sys.path.append(segmenter_dir)
 
+from segmenter import segmenter
 
 def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', model_ver_path='model_zoo/VideoMind-7B', num_threads=1, device='cuda', segmenter=None):
     """
@@ -155,3 +158,21 @@ def infer_grounding(video_path, query, model_gnd_path='model_zoo/VideoMind-7B', 
     }
 
     return results
+
+def main():
+    """
+    Main function to test the infer_grounding function.
+    """
+    video_path = "dataset/sj81PWrerDk.mp4"
+    query = "The first two people doing the action"
+
+    segmenter = segmenter.VideoSegmenter()
+
+    results = infer_grounding(video_path, query, segmenter=segmenter)
+
+    print("Results:")
+    print(json.dumps(results, indent=4))
+
+
+if __name__ == "__main__":
+    main()

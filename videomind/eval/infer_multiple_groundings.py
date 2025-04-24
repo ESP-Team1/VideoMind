@@ -35,8 +35,21 @@ def run_infer_grounding(video_path, query, output_path):
         results = json.load(f)
     return results
 
+def query_parser(query_csv):
+    """
+    Parses the query CSV file and returns a list of queries.
 
-def process_queries(video_path, queries, temp_dir="temp_results", segmenter=None):
+    Args:
+        query_csv (str): Path to the CSV file containing queries.
+
+    Returns:
+        list: A list of queries.
+    """
+    df = pd.read_excel(query_csv)
+    queries = df['grounding_queries'].tolist()
+    return queries
+
+def process_queries(video_path, query_csv, temp_dir="temp_results", segmenter=None):
     """
     Processes a list of queries sequentially on a single video.
 
@@ -50,6 +63,8 @@ def process_queries(video_path, queries, temp_dir="temp_results", segmenter=None
     """
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
+
+    queries = query_parser(query_csv)
 
     results = {}
     current_video_path = video_path
@@ -86,13 +101,8 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    queries_df = pd.read_csv(args.query_csv)
-    if "query" not in queries_df.columns:
-        raise ValueError("The CSV file must contain a 'query' column.")
-    queries = queries_df["query"].tolist()
-
     segmenter = segmenter.VideoSegmenter()
-    final_results = process_queries(args.video_path, queries, args.temp_dir, segmenter)
+    final_results = process_queries(args.video_path, args.query_csv, args.temp_dir, segmenter)
 
-    with open(args.output_path, "w") as f:
-        json.dump(final_results, f, indent=4)
+    print("Final results:")
+    print(final_results)
