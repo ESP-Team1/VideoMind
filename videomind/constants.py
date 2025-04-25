@@ -27,6 +27,7 @@ GROUNDER_PROMPT = (
     'Given a video and a text query, your goal is to temporally localize the video moment described by the query. '
     'If the query is directly describing a moment, simply localize it according to its content. '
     "Otherwise, if the moment is described as 'before/after a pivotal event', you need to determine the actual event it refers to. "
+    "However, please return [0, 0] if you cannot find the actual event. "
     'The localized moment should only cover the target event. '
     "Now I give you the query: '{}'. "
     'Please think carefully and provide your response.')
